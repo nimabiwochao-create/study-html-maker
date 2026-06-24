@@ -16,6 +16,7 @@ const textOutput = document.querySelector("#textOutput");
 const sectionCount = document.querySelector("#sectionCount");
 const readingTime = document.querySelector("#readingTime");
 const charCount = document.querySelector("#charCount");
+const organizerName = document.querySelector("#organizerName");
 
 let currentResult = null;
 let currentPreviewUrl = null;
@@ -167,6 +168,7 @@ function paintResult(result) {
   sectionCount.textContent = result.stats.sections;
   readingTime.textContent = `${result.stats.readingMinutes} 分`;
   charCount.textContent = result.stats.characters.toLocaleString();
+  organizerName.textContent = result.organizer || "local-rules";
   emptyState.hidden = true;
   rerenderButton.disabled = false;
   downloadButton.disabled = false;

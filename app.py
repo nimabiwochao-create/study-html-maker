@@ -3,8 +3,11 @@ from __future__ import annotations
 import html
 import io
 import json
+import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +30,9 @@ STATIC_DIR = ROOT / "static"
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".docx"}
 MAX_PASTE_CHARACTERS = 90_000
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "12"))
 
 
 @dataclass
@@ -118,19 +124,10 @@ def split_into_sections(text: str) -> list[StudySection]:
         current_body = []
 
     for paragraph in paragraphs:
-        maybe_heading = paragraph.replace("#", "").strip()
-        is_heading = (
-            len(maybe_heading) <= 42
-            and "\n" not in maybe_heading
-            and (
-                paragraph.startswith("#")
-                or re.match(r"^(\d+[\).、]|第.+[章節]|[一二三四五六七八九十]+、)", maybe_heading)
-            )
-        )
-
-        if is_heading:
+        heading = detect_section_heading(paragraph)
+        if heading:
             flush()
-            current_title = maybe_heading
+            current_title = heading
         else:
             current_body.append(paragraph)
 
@@ -144,8 +141,42 @@ def split_into_sections(text: str) -> list[StudySection]:
     return sections[:5]
 
 
+def detect_section_heading(block: str) -> str | None:
+    candidate = re.sub(r"\s+", " ", block.strip())
+    candidate = re.sub(r"^[-*•]\s+", "", candidate)
+    if "\n" in block or len(candidate) > 48:
+        return None
+
+    markdown = re.match(r"^#{1,3}\s+(.+)$", candidate)
+    if markdown:
+        return markdown.group(1).strip()
+
+    strong_step = re.match(
+        r"^(步驟|階段|部分|主題)\s*([一二三四五六七八九十\d]+)[：:、.\s-]*(.+)?$",
+        candidate,
+    )
+    if strong_step:
+        suffix = (strong_step.group(3) or "").strip()
+        return f"{strong_step.group(1)}{strong_step.group(2)}" + (f"：{suffix}" if suffix else "")
+
+    chapter = re.match(r"^(第\s*[一二三四五六七八九十\d]+\s*[章節])\s*[：:、.\s-]*(.+)?$", candidate)
+    if chapter:
+        suffix = (chapter.group(2) or "").strip()
+        return chapter.group(1).replace(" ", "") + (f"：{suffix}" if suffix else "")
+
+    if candidate.endswith(("：", ":")) and 6 <= len(candidate) <= 32:
+        return candidate.rstrip("：:")
+
+    return None
+
+
 def regroup_paragraphs(paragraphs: list[str]) -> list[StudySection]:
-    group_size = max(1, round(len(paragraphs) / 4))
+    if len(paragraphs) <= 3:
+        body = "\n\n".join(paragraphs)
+        return [StudySection(title=infer_title(body, 1), body=body, bullets=make_bullets(body))]
+
+    target_count = min(5, max(2, round(len(paragraphs) / 3)))
+    group_size = max(2, round(len(paragraphs) / target_count))
     grouped: list[StudySection] = []
     for index in range(0, len(paragraphs), group_size):
         body_parts = paragraphs[index : index + group_size]
@@ -153,6 +184,112 @@ def regroup_paragraphs(paragraphs: list[str]) -> list[StudySection]:
         title = infer_title(body, len(grouped) + 1)
         grouped.append(StudySection(title=title, body=body, bullets=make_bullets(body)))
     return grouped[:5]
+
+
+def build_sections(text: str) -> tuple[list[StudySection], str]:
+    ai_sections = build_sections_with_ollama(text)
+    if ai_sections:
+        return ai_sections, f"ollama:{OLLAMA_MODEL}"
+    return split_into_sections(text), "local-rules"
+
+
+def build_sections_with_ollama(text: str) -> list[StudySection] | None:
+    if os.environ.get("DISABLE_OLLAMA") == "1":
+        return None
+
+    prompt = f"""
+你是會整理學習筆記的助教。請只根據來源內容重組，不要加入來源沒有的事實。
+
+請把內容整理為 2 到 5 個邏輯通順的大章節。每個章節輸出：
+- title: 短標題，不要超過 18 個中文字
+- conclusion: 一句核心結論
+- bullets: 2 到 4 個短重點，每點不超過 45 字
+- details: 1 到 3 句用自己的話整理後的說明
+
+規則：
+- 不要把清單項目誤判為大章節。
+- 先合併相近概念，再分段。
+- 以繁體中文輸出。
+- 回傳純 JSON，不要 Markdown，不要解釋。
+
+JSON 格式：
+{{"sections":[{{"title":"...","conclusion":"...","bullets":["..."],"details":["..."]}}]}}
+
+來源內容：
+{text[:9000]}
+""".strip()
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.15},
+    }
+    request = urllib.request.Request(
+        OLLAMA_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    return parse_ai_sections(raw.get("response", ""))
+
+
+def parse_ai_sections(response_text: str) -> list[StudySection] | None:
+    try:
+        data = json.loads(extract_json_object(response_text))
+    except json.JSONDecodeError:
+        return None
+
+    raw_sections = data.get("sections")
+    if not isinstance(raw_sections, list):
+        return None
+
+    sections: list[StudySection] = []
+    for index, item in enumerate(raw_sections[:5], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = clean_ai_text(str(item.get("title", "")))[:28] or f"重點 {index}"
+        conclusion = clean_ai_text(str(item.get("conclusion", "")))
+        bullets = [
+            clean_ai_text(str(bullet))
+            for bullet in item.get("bullets", [])
+            if clean_ai_text(str(bullet))
+        ][:4]
+        details = [
+            clean_ai_text(str(detail))
+            for detail in item.get("details", [])
+            if clean_ai_text(str(detail))
+        ][:3]
+        body_parts = [conclusion, *details, *bullets]
+        body = "\n\n".join(part for part in body_parts if part)
+        if body:
+            sections.append(StudySection(title=title, body=body, bullets=bullets or make_bullets(body)))
+
+    return sections if len(sections) >= 1 else None
+
+
+def extract_json_object(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise json.JSONDecodeError("JSON object not found", text, 0)
+    return text[start : end + 1]
+
+
+def clean_ai_text(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip(" -•\t")
+    return value[:180]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -324,10 +461,17 @@ def estimate_reading_minutes(text: str) -> int:
     return max(1, minutes)
 
 
-def make_study_html(title: str, source_name: str, text: str) -> str:
-    sections = split_into_sections(text)
+def make_study_html(
+    title: str,
+    source_name: str,
+    text: str,
+    sections: list[StudySection] | None = None,
+    organizer: str = "local-rules",
+) -> str:
+    sections = sections or split_into_sections(text)
     escaped_title = html.escape(title)
     escaped_source = html.escape(source_name)
+    escaped_organizer = html.escape(organizer)
     reading_minutes = estimate_reading_minutes(text)
     word_count = len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+", text))
 
@@ -508,6 +652,7 @@ def make_study_html(title: str, source_name: str, text: str) -> str:
         <span>來源：{escaped_source}</span>
         <span>約 {reading_minutes} 分鐘閱讀</span>
         <span>{word_count} 個字詞單位</span>
+        <span>整理：{escaped_organizer}</span>
       </div>
     </header>
     <nav aria-label="章節導覽">{nav}</nav>
@@ -550,12 +695,13 @@ def build_result(filename: str, title: str, text: str) -> dict:
         raise ValueError("沒有可整理的文字。")
 
     clean_title = title.strip() or Path(filename).stem.replace("_", " ").replace("-", " ").strip() or "學習筆記"
-    sections = split_into_sections(clean_text)
+    sections, organizer = build_sections(clean_text)
     return {
         "filename": filename,
         "title": clean_title,
         "plainText": clean_text,
-        "html": make_study_html(clean_title, filename, clean_text),
+        "html": make_study_html(clean_title, filename, clean_text, sections, organizer),
+        "organizer": organizer,
         "stats": {
             "characters": len(clean_text),
             "sections": len(sections),
